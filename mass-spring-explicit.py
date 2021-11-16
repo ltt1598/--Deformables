@@ -116,7 +116,7 @@ def initialize_springs():
 def compute_gradient():
     # clear gradient
     for i in range(N_edges):
-        grad[i] = [0, 0]
+        grad[i] = ti.Vector([0, 0])
 
     # gradient of elastic potential
     for i in range(N_edges):
@@ -233,3 +233,4 @@ while gui.running:
         gui.text(
             content='D: Damping Off', pos=(0.6, 0.875), color=0xFFFFFF)
     gui.show()
+

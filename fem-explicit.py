@@ -128,7 +128,7 @@ def compute_R_2D(F):
 def compute_gradient():
     # clear gradient
     for i in range(N_edges):
-        grad[i].fill(0)
+        grad[i] = ti.Vector([0, 0])
 
     # gradient of elastic potential
     for i in range(N_triangles):
@@ -168,10 +168,10 @@ def update():
         # symplectic integration
         # elastic force + gravitation force, divding mass to get the acceleration
         if using_auto_diff:
-            acc = -x.grad[i]/m - [0, g]
+            acc = -x.grad[i]/m - ti.Vector([0.0, g])
             v[i] += dh*acc
         else:
-            acc = -grad[i]/m - [0, g]
+            acc = -grad[i]/m - ti.Vector([0.0, g])
             v[i] += dh*acc
         x[i] += dh*v[i]
 
@@ -293,3 +293,12 @@ while gui.running:
         gui.text(
             content='D: Damping Off', pos=(0.6, 0.85), color=0xFFFFFF)
     gui.show()
+
+
+
+if using_auto_diff:
+    total_energy[None]=0
+    with ti.Tape(total_energy):
+        compute_total_energy()
+else:
+    compute_gradient()
