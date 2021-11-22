@@ -95,7 +95,7 @@ def meshing():
 
 @ti.kernel
 def initialize():
-    YoungsModulus[None] = 3e7
+    YoungsModulus[None] = 3e4
     paused = True
     # init position and velocity
     for i, j in ti.ndrange(N_x, N_y):
@@ -115,7 +115,7 @@ def initialize_springs():
 @ti.kernel
 def compute_gradient():
     # clear gradient
-    for i in range(N_edges):
+    for i in grad:
         grad[i] = ti.Vector([0, 0])
 
     # gradient of elastic potential
@@ -124,7 +124,7 @@ def compute_gradient():
         r = x[a]-x[b]
         l = r.norm()
         l0 = spring_length[i]
-        k = YoungsModulus[None]*l0  # stiffness in Hooke's law
+        k = YoungsModulus[None]/l0  # stiffness in Hooke's law
         gradient = k*(l-l0)*r/l
         grad[a] += gradient
         grad[b] += -gradient

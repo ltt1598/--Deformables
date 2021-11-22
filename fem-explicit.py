@@ -96,7 +96,7 @@ def meshing():
 
 @ti.kernel
 def initialize():
-    YoungsModulus[None] = 3e6
+    YoungsModulus[None] = 1e6
     paused = True
     # init position and velocity
     for i, j in ti.ndrange(N_x, N_y):
@@ -127,7 +127,7 @@ def compute_R_2D(F):
 @ti.kernel
 def compute_gradient():
     # clear gradient
-    for i in range(N_edges):
+    for i in grad:
         grad[i] = ti.Vector([0, 0])
 
     # gradient of elastic potential
@@ -293,12 +293,3 @@ while gui.running:
         gui.text(
             content='D: Damping Off', pos=(0.6, 0.85), color=0xFFFFFF)
     gui.show()
-
-
-
-if using_auto_diff:
-    total_energy[None]=0
-    with ti.Tape(total_energy):
-        compute_total_energy()
-else:
-    compute_gradient()
