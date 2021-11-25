@@ -5,6 +5,8 @@ import numpy as np
 
 import taichi as ti
 
+import time
+
 
 @ti.data_oriented
 class Cloth:
@@ -13,40 +15,34 @@ class Cloth:
         self.NF = 2 * N**2  # number of faces
         self.NV = (N + 1)**2  # number of vertices
         self.NE = 2 * N * (N + 1) + 2 * N * N  # numbser of edges
-        self.pos = ti.Vector.field(2, ti.f32, self.NV)
         self.initPos = ti.Vector.field(2, ti.f32, self.NV)
+        self.pos = ti.Vector.field(2, ti.f32, self.NV)
         self.vel = ti.Vector.field(2, ti.f32, self.NV)
         self.force = ti.Vector.field(2, ti.f32, self.NV)
-        self.invMass = ti.field(ti.f32, self.NV)
-
+        self.mass = ti.field(ti.f32, self.NV)
         self.spring = ti.Vector.field(2, ti.i32, self.NE)
-        self.indices = ti.field(ti.i32, 2 * self.NE)
-        self.Jx = ti.Matrix.field(2, 2, ti.f32,
-                                  self.NE)  # Jacobian with respect to position
         self.rest_len = ti.field(ti.f32, self.NE)
         self.ks = 1000.0  # spring stiffness
         self.kd = 0.5  # damping constant
-        self.kf = 1.0e5  # fix point stiffness
+        self.kf = 1.0e5  # Attachment point stiffness
+        self.Jx = ti.Matrix.field(2, 2, ti.f32, self.NE)  # Force Jacobian
+        self.Jf = ti.Matrix.field(2, 2, ti.f32, 2)  # Attachment Jacobian
 
-        self.gravity = ti.Vector([0.0, -2.0])
         self.init_pos()
         self.init_edges()
-        self.MassBuilder = ti.linalg.SparseMatrixBuilder(
-            2 * self.NV, 2 * self.NV, max_num_triplets=10000)
-        self.DBuilder = ti.linalg.SparseMatrixBuilder(2 * self.NV,
-                                                      2 * self.NV,
-                                                      max_num_triplets=10000)
-        self.KBuilder = ti.linalg.SparseMatrixBuilder(2 * self.NV,
-                                                      2 * self.NV,
-                                                      max_num_triplets=10000)
-        self.init_mass_sp(self.MassBuilder)
-        self.M = self.MassBuilder.build()
-        self.fix_vertex = [self.N, self.NV - 1]
-        self.Jf = ti.Matrix.field(2, 2, ti.f32, 2)  # fix constraint hessian
+
+        # For sparse matrix solver
+        max_num_triplets = 10000
+        self.MBuilder = ti.linalg.SparseMatrixBuilder(2 * self.NV, 2 * self.NV,
+                                                      max_num_triplets)
+        self.init_mass_sp(self.MBuilder)
+        self.M = self.MBuilder.build()
+        self.KBuilder = ti.linalg.SparseMatrixBuilder(2 * self.NV, 2 * self.NV,
+                                                      max_num_triplets)
 
         # For conjugate gradient method
         self.v_next = ti.Vector.field(2, ti.f32, self.NV)
-        self.Adv = ti.Vector.field(2, ti.f32, self.NV)
+        self.Av = ti.Vector.field(2, ti.f32, self.NV)
         self.b = ti.Vector.field(2, ti.f32, self.NV)
         self.r = ti.Vector.field(2, ti.f32, self.NV)
         self.p = ti.Vector.field(2, ti.f32, self.NV)
@@ -60,7 +56,7 @@ class Cloth:
                 [0.25, 0.25])
             self.initPos[k] = self.pos[k]
             self.vel[k] = ti.Vector([0, 0])
-            self.invMass[k] = 1.0
+            self.mass[k] = 1.0
 
     @ti.kernel
     def init_edges(self):
@@ -69,32 +65,30 @@ class Cloth:
         for i, j in ti.ndrange(N + 1, N):
             idx, idx1 = i * N + j, i * (N + 1) + j
             spring[idx] = ti.Vector([idx1, idx1 + 1])
-            rest_len[idx] = (pos[idx1] - pos[idx1 + 1]).norm()
         start = N * (N + 1)
         for i, j in ti.ndrange(N, N + 1):
             idx, idx1, idx2 = start + i + j * N, i * (N + 1) + j, i * (
                 N + 1) + j + N + 1
             spring[idx] = ti.Vector([idx1, idx2])
-            rest_len[idx] = (pos[idx1] - pos[idx2]).norm()
         start = 2 * N * (N + 1)
         for i, j in ti.ndrange(N, N):
             idx, idx1, idx2 = start + i * N + j, i * (N + 1) + j, (i + 1) * (
                 N + 1) + j + 1
             spring[idx] = ti.Vector([idx1, idx2])
-            rest_len[idx] = (pos[idx1] - pos[idx2]).norm()
         start = 2 * N * (N + 1) + N * N
         for i, j in ti.ndrange(N, N):
             idx, idx1, idx2 = start + i * N + j, i * (N + 1) + j + 1, (
                 i + 1) * (N + 1) + j
             spring[idx] = ti.Vector([idx1, idx2])
-            rest_len[idx] = (pos[idx1] - pos[idx2]).norm()
+        for i in range(self.NE):
+            idx1, idx2 = spring[i]
+            rest_len[i] = (pos[idx1] - pos[idx2]).norm()
 
     @ti.kernel
     def init_mass_sp(self, M: ti.linalg.sparse_matrix_builder()):
         for i in range(self.NV):
-            mass = 1.0 / self.invMass[i]
-            M[2 * i + 0, 2 * i + 0] += mass
-            M[2 * i + 1, 2 * i + 1] += mass
+            M[2 * i + 0, 2 * i + 0] += self.mass[i]
+            M[2 * i + 1, 2 * i + 1] += self.mass[i]
 
     @ti.func
     def clear_force(self):
@@ -104,8 +98,9 @@ class Cloth:
     @ti.kernel
     def compute_force(self):
         self.clear_force()
+        gravity = ti.Vector([0.0, -2.0])
         for i in self.force:
-            self.force[i] += self.gravity / self.invMass[i]
+            self.force[i] += gravity * self.mass[i]
 
         for i in self.spring:
             idx1, idx2 = self.spring[i][0], self.spring[i][1]
@@ -115,7 +110,7 @@ class Cloth:
                                self.rest_len[i]) * dis.normalized()
             self.force[idx1] += force
             self.force[idx2] -= force
-        # fix constraint force
+        # Attachment constraint force
         self.force[self.N] += self.kf * (self.initPos[self.N] -
                                          self.pos[self.N])
         self.force[self.NV - 1] += self.kf * (self.initPos[self.NV - 1] -
@@ -135,7 +130,7 @@ class Cloth:
                 l = 1.0 / l
             self.Jx[i] = (I - self.rest_len[i] * l *
                           (I - dxtdx * l**2)) * self.ks
-        # fix point constraint force Jacobian
+        # Attachment constraint force Jacobian
         self.Jf[0] = ti.Matrix([[-self.kf, 0], [0, -self.kf]])
         self.Jf[1] = ti.Matrix([[-self.kf, 0], [0, -self.kf]])
 
@@ -179,10 +174,16 @@ class Cloth:
         self.directUpdatePosVel(h, v_next)
 
     @ti.kernel
+    def cgUpdatePosVel(self, h: ti.f32):
+        for i in self.pos:
+            self.vel[i] = self.v_next[i]
+            self.pos[i] += h * self.vel[i]
+
+    @ti.kernel
     def compute_RHS(self, h: ti.f32):
         #rhs = b = h * force + M @ v
         for i in range(self.NV):
-            self.b[i] = h * self.force[i] + 1.0 / self.invMass[i] * self.vel[i]
+            self.b[i] = h * self.force[i] + self.mass[i] * self.vel[i]
 
     @ti.func
     def dot(self, v1, v2):
@@ -196,50 +197,54 @@ class Cloth:
     def A_mult_x(self, h, dst, src):
         coeff = -h**2
         for i in range(self.NV):
-            dst[i] = 1.0 / self.invMass[i] * src[i]
+            dst[i] = self.mass[i] * src[i]
         for i in range(self.NE):
             idx1, idx2 = self.spring[i][0], self.spring[i][1]
             temp = self.Jx[i] @ (src[idx1] - src[idx2])
             dst[idx1] -= coeff * temp
             dst[idx2] += coeff * temp
-        # fix constraint
-        fix1, fix2 = self.N, self.NV - 1
-        dst[fix1] -= coeff * self.kf * src[fix1]
-        dst[fix2] -= coeff * self.kf * src[fix2]
+        # Attachment constraint
+        Attachment1, Attachment2 = self.N, self.NV - 1
+        dst[Attachment1] -= coeff * self.kf * src[Attachment1]
+        dst[Attachment2] -= coeff * self.kf * src[Attachment2]
 
     # conjugate gradient solving
     # https://www.cs.cmu.edu/~quake-papers/painless-conjugate-gradient.pdf
+
     @ti.kernel
-    def cg(self, h: ti.f32):
+    def before_ite(self) -> ti.f32:
         for i in range(self.NV):
             self.v_next[i] = ti.Vector([0.0, 0.0])
-        self.A_mult_x(h, self.Adv, self.v_next)  # Adv = A @ dv
+        self.A_mult_x(h, self.Av, self.v_next)  # Av = A @ dv
         for i in range(self.NV):  # r = b - A * dv
-            self.r[i] = self.b[i] - self.Adv[i]
+            self.r[i] = self.b[i] - self.Av[i]
         for i in range(self.NV):  # d = r
             self.p[i] = self.r[i]
         epsNew = self.dot(self.r, self.r)
-        ite, iteMax = 0, 2 * self.NV
-        while ite < iteMax and epsNew > 1.0e-6:
-            self.A_mult_x(h, self.Ap, self.p)  # Ap = A @ p
-            alpha = epsNew / self.dot(
-                self.p, self.Ap)  # alpha = (r^T * r) / dot(p, Ap)
-            for i in range(self.NV):
-                self.v_next[i] += alpha * self.p[i]  # x^{i+} += alpha * d
-                self.r[i] -= alpha * self.Ap[i]  # r^{i+1} -= alpha * Ap
-            epsOld = epsNew
-            epsNew = self.dot(self.r, self.r)
-            beta = epsNew / epsOld
-            for i in range(self.NV):
-                self.p[i] = self.r[i] + beta * self.p[
-                    i]  #p^{i+1} = r^{i+1} + beta * p^{i}
-            ite += 1
+        return epsNew
 
     @ti.kernel
-    def cgUpdatePosVel(self, h: ti.f32):
-        for i in self.pos:
-            self.vel[i] = self.v_next[i]
-            self.pos[i] += h * self.vel[i]
+    def run_iteration(self, epsNew: ti.f32) -> ti.f32:
+        self.A_mult_x(h, self.Ap, self.p)  # Ap = A @ p
+        alpha = epsNew / self.dot(self.p,
+                                  self.Ap)  # alpha = (r^T * r) / dot(p, Ap)
+        for i in range(self.NV):
+            self.v_next[i] += alpha * self.p[i]  # x^{i+} += alpha * d
+            self.r[i] -= alpha * self.Ap[i]  # r^{i+1} -= alpha * Ap
+        epsOld = epsNew
+        epsNew = self.dot(self.r, self.r)
+        beta = epsNew / epsOld
+        for i in range(self.NV):
+            self.p[i] = self.r[i] + beta * self.p[
+                i]  #p^{i+1} = r^{i+1} + beta * p^{i}
+        return epsNew
+
+    def cg(self, h: ti.f32):
+        epsNew = self.before_ite()
+        ite, iteMax = 0, 2 * self.NV
+        while ite < iteMax and epsNew > 1.0e-6:
+            epsNew = self.run_iteration(epsNew)
+            ite += 1
 
     def update_cg(self, h):
         self.compute_force()
@@ -249,46 +254,30 @@ class Cloth:
         self.cgUpdatePosVel(h)
 
     def display(self, gui, radius=5, color=0xffffff):
-        lines = self.spring.to_numpy()
-        pos = self.pos.to_numpy()
-        edgeBegin = np.zeros(shape=(lines.shape[0], 2))
-        edgeEnd = np.zeros(shape=(lines.shape[0], 2))
-        for i in range(lines.shape[0]):
-            idx1, idx2 = lines[i][0], lines[i][1]
-            edgeBegin[i] = pos[idx1]
-            edgeEnd[i] = pos[idx2]
-        gui.lines(edgeBegin, edgeEnd, radius=2, color=0x0000ff)
+        springs, pos = self.spring.to_numpy(), self.pos.to_numpy()
+        line_Begin = np.zeros(shape=(springs.shape[0], 2))
+        line_End = np.zeros(shape=(springs.shape[0], 2))
+        for i in range(springs.shape[0]):
+            idx1, idx2 = springs[i][0], springs[i][1]
+            line_Begin[i], line_End[i] = pos[idx1], pos[idx2]
+        gui.lines(line_Begin, line_End, radius=2, color=0x0000ff)
         gui.circles(self.pos.to_numpy(), radius, color)
-
-    @ti.kernel
-    def spring2indices(self):
-        for i in self.spring:
-            self.indices[2 * i + 0] = self.spring[i][0]
-            self.indices[2 * i + 1] = self.spring[i][1]
-
-    def displayGGUI(self, canvas, radius=0.01, color=(1.0, 1.0, 1.0)):
-        self.spring2indices()
-        canvas.lines(self.pos,
-                     width=0.005,
-                     indices=self.indices,
-                     color=(0.0, 0.0, 1.0))
-        canvas.circles(self.pos, radius, color)
 
 
 if __name__ == "__main__":
     ti.init(arch=ti.cpu)
-    h = 0.01
-    cloth = Cloth(N=10)
-    pause = False
+    cloth = Cloth(N=5)
     parser = argparse.ArgumentParser()
     parser.add_argument('-cg',
                         '--use_cg',
                         action='store_true',
                         help='Solve Ax=b with conjugate gradient method (CG).')
     args, unknowns = parser.parse_known_args()
-    use_cg = False
     use_cg = args.use_cg
+
     gui = ti.GUI('Implicit Mass Spring System', res=(500, 500))
+    pause = False
+    h, max_step = 0.01, 3
     while gui.running:
         for e in gui.get_events():
             if e.key == gui.ESCAPE:
@@ -296,10 +285,10 @@ if __name__ == "__main__":
             elif e.key == gui.SPACE:
                 pause = not pause
         if not pause:
-            if use_cg:
-                cloth.update_cg(h)
-            else:
-                cloth.update_direct(h)
+            for i in range(max_step):
+                if use_cg:
+                    cloth.update_cg(h)
+                else:
+                    cloth.update_direct(h)
         cloth.display(gui)
-
         gui.show()
