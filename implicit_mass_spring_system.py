@@ -23,7 +23,6 @@ class Cloth:
         self.spring = ti.Vector.field(2, ti.i32, self.NE)
         self.rest_len = ti.field(ti.f32, self.NE)
         self.ks = 1000.0  # spring stiffness
-        self.kd = 0.5  # damping constant
         self.kf = 1.0e5  # Attachment point stiffness
         self.Jx = ti.Matrix.field(2, 2, ti.f32, self.NE)  # Force Jacobian
         self.Jf = ti.Matrix.field(2, 2, ti.f32, 2)  # Attachment Jacobian
@@ -31,7 +30,7 @@ class Cloth:
         self.init_pos()
         self.init_edges()
 
-        # For sparse matrix solver
+        # For sparse matrix solver， PPT: P45
         max_num_triplets = 10000
         self.MBuilder = ti.linalg.SparseMatrixBuilder(2 * self.NV, 2 * self.NV,
                                                       max_num_triplets)
@@ -40,21 +39,21 @@ class Cloth:
         self.KBuilder = ti.linalg.SparseMatrixBuilder(2 * self.NV, 2 * self.NV,
                                                       max_num_triplets)
 
-        # For conjugate gradient method
-        self.v_next = ti.Vector.field(2, ti.f32, self.NV)
-        self.Av = ti.Vector.field(2, ti.f32, self.NV)
+        # For conjugate gradient method, PPT: P106
+        self.x = ti.Vector.field(2, ti.f32, self.NV)
+        self.Ax = ti.Vector.field(2, ti.f32, self.NV)
         self.b = ti.Vector.field(2, ti.f32, self.NV)
         self.r = ti.Vector.field(2, ti.f32, self.NV)
-        self.p = ti.Vector.field(2, ti.f32, self.NV)
-        self.Ap = ti.Vector.field(2, ti.f32, self.NV)
+        self.d = ti.Vector.field(2, ti.f32, self.NV)
+        self.Ad = ti.Vector.field(2, ti.f32, self.NV)
 
     @ti.kernel
     def init_pos(self):
         for i, j in ti.ndrange(self.N + 1, self.N + 1):
             k = i * (self.N + 1) + j
-            self.pos[k] = ti.Vector([i, j]) / self.N * 0.5 + ti.Vector(
+            self.initPos[k] = ti.Vector([i, j]) / self.N * 0.5 + ti.Vector(
                 [0.25, 0.25])
-            self.initPos[k] = self.pos[k]
+            self.pos[k] = self.initPos[k]
             self.vel[k] = ti.Vector([0, 0])
             self.mass[k] = 1.0
 
@@ -105,11 +104,12 @@ class Cloth:
         for i in self.spring:
             idx1, idx2 = self.spring[i][0], self.spring[i][1]
             pos1, pos2 = self.pos[idx1], self.pos[idx2]
-            dis = pos2 - pos1
+            dis = pos1 - pos2
+            # Hook's law
             force = self.ks * (dis.norm() -
                                self.rest_len[i]) * dis.normalized()
-            self.force[idx1] += force
-            self.force[idx2] -= force
+            self.force[idx1] -= force
+            self.force[idx2] += force
         # Attachment constraint force
         self.force[self.N] += self.kf * (self.initPos[self.N] -
                                          self.pos[self.N])
@@ -117,7 +117,7 @@ class Cloth:
                                               self.pos[self.NV - 1])
 
     @ti.kernel
-    def compute_Jacobians(self):
+    def compute_force_Jacobians(self):
         for i in self.spring:
             idx1, idx2 = self.spring[i][0], self.spring[i][1]
             pos1, pos2 = self.pos[idx1], self.pos[idx2]
@@ -155,7 +155,7 @@ class Cloth:
 
     def update_direct(self, h):
         self.compute_force()
-        self.compute_Jacobians()
+        self.compute_force_Jacobians()
         # Assemble global system
         self.assemble_K(self.KBuilder)
         K = self.KBuilder.build()
@@ -176,7 +176,7 @@ class Cloth:
     @ti.kernel
     def cgUpdatePosVel(self, h: ti.f32):
         for i in self.pos:
-            self.vel[i] = self.v_next[i]
+            self.vel[i] = self.x[i]
             self.pos[i] += h * self.vel[i]
 
     @ti.kernel
@@ -214,41 +214,41 @@ class Cloth:
     @ti.kernel
     def before_ite(self) -> ti.f32:
         for i in range(self.NV):
-            self.v_next[i] = ti.Vector([0.0, 0.0])
-        self.A_mult_x(h, self.Av, self.v_next)  # Av = A @ dv
-        for i in range(self.NV):  # r = b - A * dv
-            self.r[i] = self.b[i] - self.Av[i]
+            self.x[i] = ti.Vector([0.0, 0.0])
+        self.A_mult_x(h, self.Ax, self.x)  # Ax = A @ x
+        for i in range(self.NV):  # r = b - A @ x
+            self.r[i] = self.b[i] - self.Ax[i]
         for i in range(self.NV):  # d = r
-            self.p[i] = self.r[i]
-        epsNew = self.dot(self.r, self.r)
-        return epsNew
+            self.d[i] = self.r[i]
+        delta_new = self.dot(self.r, self.r)
+        return delta_new
 
     @ti.kernel
-    def run_iteration(self, epsNew: ti.f32) -> ti.f32:
-        self.A_mult_x(h, self.Ap, self.p)  # Ap = A @ p
-        alpha = epsNew / self.dot(self.p,
-                                  self.Ap)  # alpha = (r^T * r) / dot(p, Ap)
+    def run_iteration(self, delta_new: ti.f32) -> ti.f32:
+        self.A_mult_x(h, self.Ad, self.d)  # Ad = A @ d
+        alpha = delta_new / self.dot(self.d,
+                                     self.Ad)  # alpha = (r^T * r) / dot(d, Ad)
         for i in range(self.NV):
-            self.v_next[i] += alpha * self.p[i]  # x^{i+} += alpha * d
-            self.r[i] -= alpha * self.Ap[i]  # r^{i+1} -= alpha * Ap
-        epsOld = epsNew
-        epsNew = self.dot(self.r, self.r)
-        beta = epsNew / epsOld
+            self.x[i] += alpha * self.d[i]  # x^{i+1} = x^{i} + alpha * d
+            self.r[i] -= alpha * self.Ad[i]  # r^{i+1} = r^{i} + alpha * Ad
+        delta_old = delta_new
+        delta_new = self.dot(self.r, self.r)
+        beta = delta_new / delta_old
         for i in range(self.NV):
-            self.p[i] = self.r[i] + beta * self.p[
+            self.d[i] = self.r[i] + beta * self.d[
                 i]  #p^{i+1} = r^{i+1} + beta * p^{i}
-        return epsNew
+        return delta_new
 
     def cg(self, h: ti.f32):
-        epsNew = self.before_ite()
+        delta_new = self.before_ite()
         ite, iteMax = 0, 2 * self.NV
-        while ite < iteMax and epsNew > 1.0e-6:
-            epsNew = self.run_iteration(epsNew)
+        while ite < iteMax and delta_new > 1.0e-6:
+            delta_new = self.run_iteration(delta_new)
             ite += 1
 
     def update_cg(self, h):
         self.compute_force()
-        self.compute_Jacobians()
+        self.compute_force_Jacobians()
         self.compute_RHS(h)
         self.cg(h)
         self.cgUpdatePosVel(h)
