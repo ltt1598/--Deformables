@@ -84,7 +84,7 @@ class Cloth:
             rest_len[i] = (pos[idx1] - pos[idx2]).norm()
 
     @ti.kernel
-    def init_mass_sp(self, M: ti.linalg.sparse_matrix_builder()):
+    def init_mass_sp(self, M: ti.types.sparse_matrix_builder()):
         for i in range(self.NV):
             M[2 * i + 0, 2 * i + 0] += self.mass[i]
             M[2 * i + 1, 2 * i + 1] += self.mass[i]
@@ -135,7 +135,7 @@ class Cloth:
         self.Jf[1] = ti.Matrix([[-self.kf, 0], [0, -self.kf]])
 
     @ti.kernel
-    def assemble_K(self, K: ti.linalg.sparse_matrix_builder()):
+    def assemble_K(self, K: ti.types.sparse_matrix_builder()):
         for i in self.spring:
             idx1, idx2 = self.spring[i][0], self.spring[i][1]
             for m, n in ti.static(ti.ndrange(2, 2)):
